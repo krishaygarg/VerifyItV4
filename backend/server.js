@@ -151,23 +151,86 @@ function injectHints(htmlStr, hints) {
   return result;
 }
 
-let ORIGINAL_QUESTIONS = [];
-let AI_QUESTIONS = [];
+let dbOriginal = null;
+let dbAi = null;
 
-// Load questions from SQLite
-function loadQuestionsFromDb(dbFilename, listTarget) {
-  const localPath = path.resolve(__dirname, dbFilename);
-  const parentPath = path.resolve(__dirname, '../', dbFilename);
-  const dbFile = fs.existsSync(localPath) ? localPath : parentPath;
+function initDatabaseConnections() {
   try {
-    console.log(`Attempting to load SQLite database from: ${dbFile}`);
-    const db = new DatabaseSync(dbFile);
-    const rows = db.prepare('SELECT question_id, title, question_categories, question_content, followup, choices, correct_choice, hints FROM question').all();
+    const originalFile = getDbPath('verifyit.db');
+    if (fs.existsSync(originalFile)) {
+      dbOriginal = new DatabaseSync(originalFile);
+      console.log('Opened persistent connection to verifyit.db');
+    }
+  } catch (err) {
+    console.error('Failed to open verifyit.db:', err.message);
+  }
+  
+  try {
+    const aiFile = getDbPath('verifyit_ai.db');
+    if (fs.existsSync(aiFile)) {
+      dbAi = new DatabaseSync(aiFile);
+      console.log('Opened persistent connection to verifyit_ai.db');
+    }
+  } catch (err) {
+    console.error('Failed to open verifyit_ai.db:', err.message);
+  }
+}
+
+function getSqlWhereClause(categories) {
+  if (!categories || categories.length === 0) return { clause: '', params: [] };
+  
+  const clauses = [];
+  const params = [];
+  
+  categories.forEach(cat => {
+    const catLower = cat.toLowerCase();
+    let keywords = [];
+    if (catLower.includes('civics')) {
+      keywords = ['Civics', 'Constitution', 'Amendment', 'Government'];
+    } else if (catLower.includes('news') || catLower.includes('literacy')) {
+      keywords = ['News', 'Literacy', 'Disinformation', 'Bias', 'Media', 'Fact'];
+    } else if (catLower.includes('vote') || catLower.includes('voting')) {
+      keywords = ['Vote', 'Voting', 'Voter', 'Election', 'Suppression'];
+    }
+    
+    keywords.forEach(kw => {
+      clauses.push('question_categories LIKE ?');
+      params.push(`%${kw}%`);
+    });
+  });
+  
+  if (clauses.length === 0) return { clause: '', params: [] };
+  return {
+    clause: ` WHERE ${clauses.join(' OR ')}`,
+    params
+  };
+}
+
+function fetchQuestions(dbSelection, categories, count = 10) {
+  const db = dbSelection === 'ai' ? dbAi : dbOriginal;
+  
+  if (!db) {
+    console.log(`Database connection missing for ${dbSelection}. Using fallbacks.`);
+    let filtered = FALLBACK_QUESTIONS;
+    if (categories && categories.length > 0) {
+      const requestedCats = categories.map(c => c.toLowerCase());
+      filtered = FALLBACK_QUESTIONS.filter(q => {
+        const cats = q.categories || [q.category];
+        return cats.some(cat => requestedCats.includes(cat.toLowerCase()));
+      });
+    }
+    return [...filtered].sort(() => Math.random() - 0.5).slice(0, count);
+  }
+  
+  try {
+    const { clause, params } = getSqlWhereClause(categories);
+    const query = `SELECT question_id, title, question_categories, question_content, followup, choices, correct_choice, hints FROM question${clause} ORDER BY random()`;
+    
+    const rows = db.prepare(query).all(...params);
     
     const loaded = [];
     for (const row of rows) {
       const parsedChoices = parseChoices(row.choices);
-      // Skip questions that fail parsing, or have less than 2 options
       if (parsedChoices.length < 2 || row.correct_choice < 1 || row.correct_choice > parsedChoices.length) {
         continue;
       }
@@ -179,7 +242,6 @@ function loadQuestionsFromDb(dbFilename, listTarget) {
       let text = decodeHtmlEntities(row.question_content);
       let explanation = row.followup ? decodeHtmlEntities(row.followup) : 'No explanation provided.';
       
-      // Auto-heal flipped database content (empty followup but long content)
       const isEmptyHtml = (str) => {
         if (!str) return true;
         const clean = str.replace(/<[^>]*>/g, '').replace(/\s/g, '');
@@ -191,7 +253,6 @@ function loadQuestionsFromDb(dbFilename, listTarget) {
         explanation = decodeHtmlEntities(row.question_content);
       }
 
-      // Format HTML and inject tooltip hints
       text = injectHints(cleanHtml(text), hintsArray);
       explanation = injectHints(cleanHtml(explanation), hintsArray);
 
@@ -205,18 +266,69 @@ function loadQuestionsFromDb(dbFilename, listTarget) {
         correctAnswer: correctAnswerLetter,
         explanation
       });
+      
+      if (loaded.length >= count) {
+        break;
+      }
     }
     
-    if (loaded.length > 0) {
-      if (listTarget === 'original') ORIGINAL_QUESTIONS = loaded;
-      else if (listTarget === 'ai') AI_QUESTIONS = loaded;
-      console.log(`Loaded ${loaded.length} questions from ${dbFilename}`);
-    } else {
-      console.log(`No valid questions parsed from ${dbFilename}.`);
+    // If we didn't find enough matching database questions, try fetching any questions as backup
+    if (loaded.length < count && categories && categories.length > 0) {
+      const backupQuery = `SELECT question_id, title, question_categories, question_content, followup, choices, correct_choice, hints FROM question ORDER BY random()`;
+      const backupRows = db.prepare(backupQuery).all();
+      for (const row of backupRows) {
+        if (loaded.some(item => item.id === row.question_id)) continue;
+        const parsedChoices = parseChoices(row.choices);
+        if (parsedChoices.length < 2 || row.correct_choice < 1 || row.correct_choice > parsedChoices.length) continue;
+        
+        const mappedCats = getMappedCategories(row.question_categories);
+        const correctAnswerLetter = String.fromCharCode(97 + row.correct_choice - 1);
+        const hintsArray = row.hints ? parseChoices(row.hints).map(h => h.text) : [];
+        
+        let text = decodeHtmlEntities(row.question_content);
+        let explanation = row.followup ? decodeHtmlEntities(row.followup) : 'No explanation provided.';
+        
+        const isEmptyHtml = (str) => {
+          if (!str) return true;
+          const clean = str.replace(/<[^>]*>/g, '').replace(/\s/g, '');
+          return clean === '';
+        };
+        
+        if (isEmptyHtml(row.followup) && !isEmptyHtml(row.question_content)) {
+          text = `<h3>${decodeHtmlEntities(row.title)}</h3>`;
+          explanation = decodeHtmlEntities(row.question_content);
+        }
+
+        text = injectHints(cleanHtml(text), hintsArray);
+        explanation = injectHints(cleanHtml(explanation), hintsArray);
+
+        loaded.push({
+          id: row.question_id,
+          title: row.title,
+          categories: mappedCats,
+          text,
+          type: parsedChoices.length === 2 ? 'boolean' : 'multiple-choice',
+          options: parsedChoices,
+          correctAnswer: correctAnswerLetter,
+          explanation
+        });
+        
+        if (loaded.length >= count) break;
+      }
     }
+    
+    return loaded;
   } catch (err) {
-    console.error(`Failed to load ${dbFilename}. Using fallback questions.`, err.message);
-    if (listTarget === 'original') ORIGINAL_QUESTIONS = FALLBACK_QUESTIONS;
+    console.error('SQLite query failed, falling back to in-memory questions:', err.message);
+    let filtered = FALLBACK_QUESTIONS;
+    if (categories && categories.length > 0) {
+      const requestedCats = categories.map(c => c.toLowerCase());
+      filtered = FALLBACK_QUESTIONS.filter(q => {
+        const cats = q.categories || [q.category];
+        return cats.some(cat => requestedCats.includes(cat.toLowerCase()));
+      });
+    }
+    return [...filtered].sort(() => Math.random() - 0.5).slice(0, count);
   }
 }
 
@@ -254,19 +366,9 @@ app.get('/api/questions', (req, res) => {
   const categoriesParam = req.query.categories;
   const count = parseInt(req.query.count, 10) || 10;
   
-  let QUESTIONS = dbSelection === 'ai' ? AI_QUESTIONS : ORIGINAL_QUESTIONS;
-  let filtered = QUESTIONS;
-  
-  if (categoriesParam) {
-    const requestedCats = categoriesParam.split(',').map(c => c.trim().toLowerCase());
-    filtered = QUESTIONS.filter(q => 
-      q.categories.some(cat => requestedCats.includes(cat.toLowerCase()))
-    );
-  }
-  
-  // Shuffle and return requested count
-  const shuffled = [...filtered].sort(() => Math.random() - 0.5);
-  res.json(shuffled.slice(0, count));
+  const categories = categoriesParam ? categoriesParam.split(',').map(c => c.trim()) : [];
+  const questions = fetchQuestions(dbSelection, categories, count);
+  res.json(questions);
 });
 
 // Room Game Sessions
@@ -287,18 +389,7 @@ io.on('connection', (socket) => {
   socket.on('room:create', ({ categories, db: dbSelection } = {}) => {
     const code = generateRoomCode();
     
-    const QUESTIONS = dbSelection === 'ai' ? AI_QUESTIONS : ORIGINAL_QUESTIONS;
-    
-    // Filter and prepare question set for this game
-    let gameQuestions = QUESTIONS;
-    if (categories && categories.length > 0) {
-      const requestedCats = categories.map(c => c.toLowerCase());
-      gameQuestions = QUESTIONS.filter(q => 
-        q.categories.some(cat => requestedCats.includes(cat.toLowerCase()))
-      );
-    }
-    // Shuffle and pick top 10 questions
-    gameQuestions = [...gameQuestions].sort(() => Math.random() - 0.5).slice(0, 10);
+    const gameQuestions = fetchQuestions(dbSelection, categories, 10);
 
     const room = {
       code,
@@ -526,8 +617,7 @@ function endQuestion(room) {
 async function startApp() {
   await verifyDatabaseExists('verifyit.db');
   await verifyDatabaseExists('verifyit_ai.db');
-  loadQuestionsFromDb('verifyit.db', 'original');
-  loadQuestionsFromDb('verifyit_ai.db', 'ai');
+  initDatabaseConnections();
   
   server.listen(PORT, () => {
     console.log(`VerifyIt server running on port ${PORT}`);
