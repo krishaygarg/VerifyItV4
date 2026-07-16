@@ -5,10 +5,19 @@ import cors from 'cors';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
+import { Readable } from 'stream';
+import { finished } from 'stream/promises';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dbPath = path.resolve(__dirname, '../verifyit.db');
+
+const getDbPath = (filename) => {
+  const localPath = path.resolve(__dirname, filename);
+  const parentPath = path.resolve(__dirname, '../', filename);
+  return fs.existsSync(localPath) ? localPath : parentPath;
+};
+const dbPath = getDbPath('verifyit.db');
 
 const app = express();
 app.use(cors());
@@ -147,7 +156,9 @@ let AI_QUESTIONS = [];
 
 // Load questions from SQLite
 function loadQuestionsFromDb(dbFilename, listTarget) {
-  const dbFile = path.resolve(__dirname, '../', dbFilename);
+  const localPath = path.resolve(__dirname, dbFilename);
+  const parentPath = path.resolve(__dirname, '../', dbFilename);
+  const dbFile = fs.existsSync(localPath) ? localPath : parentPath;
   try {
     console.log(`Attempting to load SQLite database from: ${dbFile}`);
     const db = new DatabaseSync(dbFile);
@@ -209,9 +220,30 @@ function loadQuestionsFromDb(dbFilename, listTarget) {
   }
 }
 
-// Initialize database loading
-loadQuestionsFromDb('verifyit.db', 'original');
-loadQuestionsFromDb('verifyit_ai.db', 'ai');
+const DB_DOWNLOAD_URL = process.env.DB_DOWNLOAD_URL || '';
+
+async function verifyDatabaseExists(dbFilename) {
+  const localPath = path.resolve(__dirname, dbFilename);
+  const parentPath = path.resolve(__dirname, '../', dbFilename);
+  
+  if (fs.existsSync(localPath) || fs.existsSync(parentPath)) {
+    return;
+  }
+  
+  if (dbFilename === 'verifyit.db' && DB_DOWNLOAD_URL) {
+    console.log(`verifyit.db is missing. Downloading from ${DB_DOWNLOAD_URL}...`);
+    try {
+      const res = await fetch(DB_DOWNLOAD_URL);
+      if (!res.ok) throw new Error(`Failed to fetch database: ${res.statusText}`);
+      
+      const fileStream = fs.createWriteStream(parentPath);
+      await finished(Readable.fromWeb(res.body).pipe(fileStream));
+      console.log(`verifyit.db successfully downloaded to ${parentPath}`);
+    } catch (err) {
+      console.error(`Failed to download database file on startup:`, err.message);
+    }
+  }
+}
 
 // Express API endpoints
 app.get('/api/questions', (req, res) => {
@@ -487,6 +519,15 @@ function endQuestion(room) {
   });
 }
 
-server.listen(PORT, () => {
-  console.log(`VerifyIt server running on port ${PORT}`);
-});
+// Initialize server and load databases
+async function startApp() {
+  await verifyDatabaseExists('verifyit.db');
+  loadQuestionsFromDb('verifyit.db', 'original');
+  loadQuestionsFromDb('verifyit_ai.db', 'ai');
+  
+  server.listen(PORT, () => {
+    console.log(`VerifyIt server running on port ${PORT}`);
+  });
+}
+
+startApp();

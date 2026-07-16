@@ -1,0 +1,20 @@
+# fly.toml app configuration file generated for verifyit-v4-backend
+# For more info see https://fly.io/docs/reference/configuration/
+
+app = "verifyit-v4-backend"
+primary_region = "bos"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[vm]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
