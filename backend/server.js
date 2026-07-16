@@ -6,10 +6,11 @@ import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
-import { Readable } from 'stream';
-import { finished } from 'stream/promises';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 
 const __filename = fileURLToPath(import.meta.url);
+const execPromise = promisify(exec);
 const __dirname = path.dirname(__filename);
 
 const getDbPath = (filename) => {
@@ -346,16 +347,13 @@ async function verifyDatabaseExists(dbFilename) {
   const downloadUrl = dbFilename === 'verifyit.db' ? DB_DOWNLOAD_URL : DB_AI_DOWNLOAD_URL;
   
   if (downloadUrl) {
-    console.log(`${dbFilename} is missing. Downloading from ${downloadUrl}...`);
+    console.log(`${dbFilename} is missing. Downloading from ${downloadUrl} using curl...`);
     try {
-      const res = await fetch(downloadUrl);
-      if (!res.ok) throw new Error(`Failed to fetch database: ${res.statusText}`);
-      
-      const fileStream = fs.createWriteStream(parentPath);
-      await finished(Readable.fromWeb(res.body).pipe(fileStream));
+      const command = `curl -L -o "${parentPath}" "${downloadUrl}"`;
+      await execPromise(command);
       console.log(`${dbFilename} successfully downloaded to ${parentPath}`);
     } catch (err) {
-      console.error(`Failed to download ${dbFilename} on startup:`, err.message);
+      console.error(`Failed to download ${dbFilename} on startup using curl:`, err.message);
     }
   }
 }
