@@ -225,12 +225,44 @@ function fetchQuestions(dbSelection, categories, count = 10) {
   
   try {
     const { clause, params } = getSqlWhereClause(categories);
-    const query = `SELECT question_id, title, question_categories, question_content, followup, choices, correct_choice, hints FROM question${clause} ORDER BY random()`;
+    // Pass 1: Select only the tiny question_id strings, shuffled. Uses virtually 0 RAM.
+    const query = `SELECT question_id FROM question${clause} ORDER BY random()`;
+    const idRows = db.prepare(query).all(...params);
     
-    const rows = db.prepare(query).all(...params);
+    const selectedIds = [];
+    for (const row of idRows) {
+      selectedIds.push(row.question_id);
+      if (selectedIds.length >= count) {
+        break;
+      }
+    }
+    
+    // Backup: If not enough matching questions, pick random IDs as backfill
+    if (selectedIds.length < count) {
+      const backupQuery = `SELECT question_id FROM question ORDER BY random()`;
+      const backupRows = db.prepare(backupQuery).all();
+      for (const row of backupRows) {
+        if (!selectedIds.includes(row.question_id)) {
+          selectedIds.push(row.question_id);
+        }
+        if (selectedIds.length >= count) {
+          break;
+        }
+      }
+    }
+
+    if (selectedIds.length === 0) {
+      return [];
+    }
+
+    // Pass 2: Select full rows including heavy Base64 HTML content only for the 10 chosen questions!
+    const placeholders = selectedIds.map(() => '?').join(',');
+    const detailQuery = `SELECT question_id, title, question_categories, question_content, followup, choices, correct_choice, hints FROM question WHERE question_id IN (${placeholders})`;
+    
+    const detailRows = db.prepare(detailQuery).all(...selectedIds);
     
     const loaded = [];
-    for (const row of rows) {
+    for (const row of detailRows) {
       const parsedChoices = parseChoices(row.choices);
       if (parsedChoices.length < 2 || row.correct_choice < 1 || row.correct_choice > parsedChoices.length) {
         continue;
@@ -267,58 +299,10 @@ function fetchQuestions(dbSelection, categories, count = 10) {
         correctAnswer: correctAnswerLetter,
         explanation
       });
-      
-      if (loaded.length >= count) {
-        break;
-      }
     }
     
-    // If we didn't find enough matching database questions, try fetching any questions as backup
-    if (loaded.length < count && categories && categories.length > 0) {
-      const backupQuery = `SELECT question_id, title, question_categories, question_content, followup, choices, correct_choice, hints FROM question ORDER BY random()`;
-      const backupRows = db.prepare(backupQuery).all();
-      for (const row of backupRows) {
-        if (loaded.some(item => item.id === row.question_id)) continue;
-        const parsedChoices = parseChoices(row.choices);
-        if (parsedChoices.length < 2 || row.correct_choice < 1 || row.correct_choice > parsedChoices.length) continue;
-        
-        const mappedCats = getMappedCategories(row.question_categories);
-        const correctAnswerLetter = String.fromCharCode(97 + row.correct_choice - 1);
-        const hintsArray = row.hints ? parseChoices(row.hints).map(h => h.text) : [];
-        
-        let text = decodeHtmlEntities(row.question_content);
-        let explanation = row.followup ? decodeHtmlEntities(row.followup) : 'No explanation provided.';
-        
-        const isEmptyHtml = (str) => {
-          if (!str) return true;
-          const clean = str.replace(/<[^>]*>/g, '').replace(/\s/g, '');
-          return clean === '';
-        };
-        
-        if (isEmptyHtml(row.followup) && !isEmptyHtml(row.question_content)) {
-          text = `<h3>${decodeHtmlEntities(row.title)}</h3>`;
-          explanation = decodeHtmlEntities(row.question_content);
-        }
-
-        text = injectHints(cleanHtml(text), hintsArray);
-        explanation = injectHints(cleanHtml(explanation), hintsArray);
-
-        loaded.push({
-          id: row.question_id,
-          title: row.title,
-          categories: mappedCats,
-          text,
-          type: parsedChoices.length === 2 ? 'boolean' : 'multiple-choice',
-          options: parsedChoices,
-          correctAnswer: correctAnswerLetter,
-          explanation
-        });
-        
-        if (loaded.length >= count) break;
-      }
-    }
-    
-    return loaded;
+    // SQLite IN does not preserve order, so we shuffle the final 10 questions
+    return loaded.sort(() => Math.random() - 0.5);
   } catch (err) {
     console.error('SQLite query failed, falling back to in-memory questions:', err.message);
     let filtered = FALLBACK_QUESTIONS;
