@@ -221,6 +221,7 @@ function loadQuestionsFromDb(dbFilename, listTarget) {
 }
 
 const DB_DOWNLOAD_URL = process.env.DB_DOWNLOAD_URL || '';
+const DB_AI_DOWNLOAD_URL = process.env.DB_AI_DOWNLOAD_URL || '';
 
 async function verifyDatabaseExists(dbFilename) {
   const localPath = path.resolve(__dirname, dbFilename);
@@ -230,17 +231,19 @@ async function verifyDatabaseExists(dbFilename) {
     return;
   }
   
-  if (dbFilename === 'verifyit.db' && DB_DOWNLOAD_URL) {
-    console.log(`verifyit.db is missing. Downloading from ${DB_DOWNLOAD_URL}...`);
+  const downloadUrl = dbFilename === 'verifyit.db' ? DB_DOWNLOAD_URL : DB_AI_DOWNLOAD_URL;
+  
+  if (downloadUrl) {
+    console.log(`${dbFilename} is missing. Downloading from ${downloadUrl}...`);
     try {
-      const res = await fetch(DB_DOWNLOAD_URL);
+      const res = await fetch(downloadUrl);
       if (!res.ok) throw new Error(`Failed to fetch database: ${res.statusText}`);
       
       const fileStream = fs.createWriteStream(parentPath);
       await finished(Readable.fromWeb(res.body).pipe(fileStream));
-      console.log(`verifyit.db successfully downloaded to ${parentPath}`);
+      console.log(`${dbFilename} successfully downloaded to ${parentPath}`);
     } catch (err) {
-      console.error(`Failed to download database file on startup:`, err.message);
+      console.error(`Failed to download ${dbFilename} on startup:`, err.message);
     }
   }
 }
@@ -522,6 +525,7 @@ function endQuestion(room) {
 // Initialize server and load databases
 async function startApp() {
   await verifyDatabaseExists('verifyit.db');
+  await verifyDatabaseExists('verifyit_ai.db');
   loadQuestionsFromDb('verifyit.db', 'original');
   loadQuestionsFromDb('verifyit_ai.db', 'ai');
   
